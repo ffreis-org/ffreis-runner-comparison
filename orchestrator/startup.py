@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
+from os import environ as os_environ
+from subprocess import Popen as subprocess_Popen, TimeoutExpired as subprocess_TimeoutExpired, call as subprocess_call, check_call as subprocess_check_call
 from contextlib import AbstractContextManager
 from pathlib import Path
 
-import yaml
+from yaml import safe_load as yaml_safe_load
 
 
 class ModeRunner(AbstractContextManager["ModeRunner"]):
@@ -21,26 +21,26 @@ class ModeRunner(AbstractContextManager["ModeRunner"]):
         self.hub_root = hub_root
         self.mode = mode
         self.active_services = active_services
-        self.processes: list[subprocess.Popen[bytes]] = []
+        self.processes: list[subprocess_Popen[bytes]] = []
         config_file = (
             hub_root / "benchmarks" / "onnx-runner-comparison" / "config" / "modes" / f"{mode}.yaml"
         )
-        self.config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        self.config = yaml_safe_load(config_file.read_text(encoding="utf-8"))
 
     def __enter__(self) -> "ModeRunner":
         if self.mode == "container":
             compose_file = self.config["compose_file"]
-            subprocess.check_call(
+            subprocess_check_call(
                 ["./scripts/compose.sh", "-f", compose_file, "up", "-d", "--build"],
                 cwd=self.hub_root,
             )
             return self
 
         for step in self.config.get("setup", []):
-            env = os.environ.copy()
+            env = os_environ.copy()
             env.pop("VIRTUAL_ENV", None)
             env.update(step.get("env", {}))
-            subprocess.check_call(step["cmd"], cwd=self.hub_root / step["cwd"], env=env)
+            subprocess_check_call(step["cmd"], cwd=self.hub_root / step["cwd"], env=env)
 
         for proc in self.config.get("processes", []):
             service_name = proc.get("service")
@@ -50,17 +50,17 @@ class ModeRunner(AbstractContextManager["ModeRunner"]):
                 and service_name not in self.active_services
             ):
                 continue
-            env = os.environ.copy()
+            env = os_environ.copy()
             env.pop("VIRTUAL_ENV", None)
             env.update(proc.get("env", {}))
-            p = subprocess.Popen(proc["cmd"], cwd=self.hub_root / proc["cwd"], env=env)
+            p = subprocess_Popen(proc["cmd"], cwd=self.hub_root / proc["cwd"], env=env)
             self.processes.append(p)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
         if self.mode == "container":
             compose_file = self.config["compose_file"]
-            subprocess.call(
+            subprocess_call(
                 ["./scripts/compose.sh", "-f", compose_file, "down", "--remove-orphans"],
                 cwd=self.hub_root,
             )
@@ -72,6 +72,6 @@ class ModeRunner(AbstractContextManager["ModeRunner"]):
         for p in self.processes:
             try:
                 p.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+            except subprocess_TimeoutExpired:
                 p.kill()
         return None

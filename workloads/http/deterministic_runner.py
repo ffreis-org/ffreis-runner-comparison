@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import time
+from time import perf_counter as time_perf_counter, sleep as time_sleep
 from statistics import mean
 from typing import Callable
 
@@ -33,24 +33,24 @@ def run_constant_rate(
 
     total_requests = rate_rps * duration_s
     period_s = 1.0 / float(rate_rps)
-    start_all = time.perf_counter()
+    start_all = time_perf_counter()
     latencies_ms: list[float] = []
     failures = 0
 
     for idx in range(total_requests):
         scheduled = start_all + (idx * period_s)
-        now = time.perf_counter()
+        now = time_perf_counter()
         if scheduled > now:
-            time.sleep(scheduled - now)
+            time_sleep(scheduled - now)
 
-        req_start = time.perf_counter()
+        req_start = time_perf_counter()
         try:
             send_once()
-            latencies_ms.append((time.perf_counter() - req_start) * 1000.0)
+            latencies_ms.append((time_perf_counter() - req_start) * 1000.0)
         except Exception:
             failures += 1
 
-    elapsed = max(time.perf_counter() - start_all, 1e-12)
+    elapsed = max(time_perf_counter() - start_all, 1e-12)
     success_count = len(latencies_ms)
     return {
         "requests": float(total_requests),
