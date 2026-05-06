@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import httpx
+from httpx import post as httpx_post
 from hypothesis import given, settings
 
 from workloads.hypothesis.strategies import csv_floats, matrix_to_csv
 
 
 def _invoke(base_url: str, payload: bytes) -> list[list[float]]:
-    response = httpx.post(
+    response = httpx_post(
         f"{base_url}/invocations",
         content=payload,
         headers={"Content-Type": "text/csv", "Accept": "application/json"},

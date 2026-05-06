@@ -1,0 +1,41 @@
+name: Lint
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "orchestrator/**"
+      - "workloads/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Makefile"
+      - ".github/workflows/lint.yml"
+  push:
+    branches: [main]
+    paths:
+      - "orchestrator/**"
+      - "workloads/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Makefile"
+      - ".github/workflows/lint.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    uses: FelipeFuhr/ffreis-workflows-python/.github/workflows/python-lint.yml@1ce012b023b91e4c293846af4cfd93062d36d1be
+    with:
+      python-version: "3.11"
+      uv-extras: "dev"
+      source-dirs: "orchestrator workloads tests"
+      mypy-dirs: "orchestrator workloads"
+

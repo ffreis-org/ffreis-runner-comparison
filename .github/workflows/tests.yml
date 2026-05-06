@@ -1,0 +1,40 @@
+name: Unit Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "orchestrator/**"
+      - "workloads/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Makefile"
+      - ".github/workflows/tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "orchestrator/**"
+      - "workloads/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Makefile"
+      - ".github/workflows/tests.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    uses: FelipeFuhr/ffreis-workflows-python/.github/workflows/python-test.yml@1ce012b023b91e4c293846af4cfd93062d36d1be
+    with:
+      python-version: "3.11"
+      uv-extras: "dev"
+      test-dir: "tests"
+

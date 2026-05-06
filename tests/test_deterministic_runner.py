@@ -1,7 +1,7 @@
-import sys
+from sys import path as sys_path
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys_path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from workloads.http.deterministic_runner import run_constant_rate
 

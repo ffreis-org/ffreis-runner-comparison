@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import argparse
-import json
-import shutil
-import subprocess
-import time
+from argparse import ArgumentParser as argparse_ArgumentParser
+from json import dumps as json_dumps
+from shutil import copy2 as shutil_copy2
+from subprocess import check_call as subprocess_check_call
+from time import perf_counter as time_perf_counter
 from pathlib import Path
 from statistics import mean
 from typing import Any
 
-import httpx
-import yaml
+from httpx import Response as httpx_Response, post as httpx_post
+from yaml import safe_load as yaml_safe_load
 
 from orchestrator.startup import ModeRunner
 from orchestrator.wait_ready import wait_http_ok
@@ -26,9 +26,9 @@ def _invoke(
     payload: bytes,
     content_type: str,
     accept: str,
-) -> httpx.Response:
+) -> httpx_Response:
     headers = {"Content-Type": content_type, "Accept": accept}
-    return httpx.post(f"{base_url}{path}", content=payload, headers=headers, timeout=10.0)
+    return httpx_post(f"{base_url}{path}", content=payload, headers=headers, timeout=10.0)
 
 
 def _p95_ms(latencies_ms: list[float]) -> float:
@@ -74,9 +74,9 @@ def _measure_latency(
         response.raise_for_status()
 
     latencies_ms: list[float] = []
-    start_all = time.perf_counter()
+    start_all = time_perf_counter()
     for _ in range(measured_requests):
-        start = time.perf_counter()
+        start = time_perf_counter()
         response = _invoke(
             base_url=base_url,
             path=path,
@@ -85,8 +85,8 @@ def _measure_latency(
             accept=accept,
         )
         response.raise_for_status()
-        latencies_ms.append((time.perf_counter() - start) * 1000.0)
-    elapsed_all = time.perf_counter() - start_all
+        latencies_ms.append((time_perf_counter() - start) * 1000.0)
+    elapsed_all = time_perf_counter() - start_all
     rps = measured_requests / elapsed_all if elapsed_all > 0 else 0.0
     return {
         "mean_ms": mean(latencies_ms),
@@ -180,7 +180,7 @@ def _load_scenarios(root: Path, selected: str) -> list[dict[str, object]]:
 
     scenario_map: dict[str, dict[str, object]] = {}
     for folder in discovered:
-        spec = yaml.safe_load((folder / "scenario.yaml").read_text(encoding="utf-8"))
+        spec = yaml_safe_load((folder / "scenario.yaml").read_text(encoding="utf-8"))
         if not isinstance(spec, dict):
             raise RuntimeError(f"Invalid scenario.yaml in {folder}")
         if bool(spec.get("enabled", True)) is False:
@@ -213,7 +213,7 @@ def _prepare_scenario_model(hub_root: Path, scenario: dict[str, object]) -> None
         cwd = prepare.get("cwd")
         if not isinstance(cmd, list) or not isinstance(cwd, str):
             raise RuntimeError(f"Invalid model.prepare in {folder / 'scenario.yaml'}")
-        subprocess.check_call(cmd, cwd=hub_root / cwd)
+        subprocess_check_call(cmd, cwd=hub_root / cwd)
         return
 
     source = model_cfg.get("source")
@@ -223,11 +223,11 @@ def _prepare_scenario_model(hub_root: Path, scenario: dict[str, object]) -> None
             str(model_cfg.get("runtime_path", "/tmp/onnx-runner-comparison/model.onnx"))
         )
         runtime_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, runtime_path)
+        shutil_copy2(src, runtime_path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare Python vs Rust ONNX runners")
+    parser = argparse_ArgumentParser(description="Compare Python vs Rust ONNX runners")
     parser.add_argument("--mode", choices=["container", "native"], required=True)
     parser.add_argument("--checks", default="parity,property,perf")
     parser.add_argument(
@@ -418,7 +418,7 @@ def main() -> None:
     }
     report_path = Path(args.report_out)
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    report_path.write_text(json_dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[report] {report_path}")
     print("[summary]", all_results)
 
