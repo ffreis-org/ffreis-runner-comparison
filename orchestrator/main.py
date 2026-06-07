@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from argparse import ArgumentParser as argparse_ArgumentParser
 from json import dumps as json_dumps
 from pathlib import Path
@@ -9,7 +10,7 @@ from shutil import copy2 as shutil_copy2
 from statistics import mean
 from subprocess import check_call as subprocess_check_call
 from time import perf_counter as time_perf_counter
-from typing import Any
+from typing import Any, cast
 
 from httpx import Response as httpx_Response
 from httpx import post as httpx_post
@@ -220,11 +221,264 @@ def _prepare_scenario_model(hub_root: Path, scenario: dict[str, object]) -> None
     source = model_cfg.get("source")
     if isinstance(source, str):
         src = folder / source
-        runtime_path = Path(
-            str(model_cfg.get("runtime_path", "/tmp/onnx-runner-comparison/model.onnx"))
+        default_runtime_path = os.path.join(
+            os.path.expanduser("~"), ".onnx-runner-comparison", "model.onnx"
         )
-        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path = Path(str(model_cfg.get("runtime_path", default_runtime_path)))
+        runtime_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         shutil_copy2(src, runtime_path)
+
+
+def _parse_request_cfg(
+    scenario_id: str, scenario: dict[str, object]
+) -> tuple[str, str, str, str, bytes]:
+    """Extract and validate request parameters from a scenario config."""
+    request_cfg = scenario.get("request", {})
+    if not isinstance(request_cfg, dict):
+        raise RuntimeError(f"Invalid request section for scenario={scenario_id}")
+    path = str(request_cfg.get("path", "/invocations"))
+    health_path = str(request_cfg.get("health_path", "/healthz"))
+    content_type = str(request_cfg.get("content_type", "text/csv"))
+    accept = str(request_cfg.get("accept", "application/json"))
+    payload_file = request_cfg.get("payload_file")
+    if not isinstance(payload_file, str):
+        raise RuntimeError(f"Scenario={scenario_id} must define request.payload_file")
+    payload = (Path(scenario["_folder"]) / payload_file).read_bytes()
+    return path, health_path, content_type, accept, payload
+
+
+def _collect_perf_stats(
+    *,
+    scenario_id: str,
+    service_bases: dict[str, str],
+    path: str,
+    payload: bytes,
+    content_type: str,
+    accept: str,
+    perf_runner: str,
+    warmup_requests: int,
+    measured_requests: int,
+    rate_rps: int,
+    duration_s: int,
+) -> dict[str, dict[str, float]]:
+    """Collect per-service latency stats for the perf check."""
+    perf_stats: dict[str, dict[str, float]] = {}
+    for service_name, base_url in sorted(service_bases.items()):
+        if perf_runner == "deterministic_http":
+            perf_stats[service_name] = _measure_latency_deterministic(
+                base_url=base_url,
+                path=path,
+                payload=payload,
+                content_type=content_type,
+                accept=accept,
+                warmup_requests=warmup_requests,
+                rate_rps=rate_rps,
+                duration_s=duration_s,
+            )
+        elif perf_runner == "request_count":
+            perf_stats[service_name] = _measure_latency(
+                base_url=base_url,
+                path=path,
+                payload=payload,
+                content_type=content_type,
+                accept=accept,
+                warmup_requests=warmup_requests,
+                measured_requests=measured_requests,
+            )
+        else:
+            raise RuntimeError(f"Scenario={scenario_id} unknown perf_runner={perf_runner}")
+    return perf_stats
+
+
+def _compute_ratio_summary(
+    *,
+    scenario_id: str,
+    perf_stats: dict[str, dict[str, float]],
+    baseline_service: str,
+    max_p95_ratio: float,
+    max_mean_ratio: float,
+) -> dict[str, dict[str, float]]:
+    """Compute and validate per-service ratio summary against the baseline."""
+    baseline_stats = perf_stats[baseline_service]
+    ratio_summary: dict[str, dict[str, float]] = {}
+    for service_name, stats in perf_stats.items():
+        if service_name == baseline_service:
+            continue
+        p95_ratio = stats["p95_ms"] / baseline_stats["p95_ms"] if baseline_stats["p95_ms"] else 1.0
+        mean_ratio = (
+            stats["mean_ms"] / baseline_stats["mean_ms"] if baseline_stats["mean_ms"] else 1.0
+        )
+        if p95_ratio > max_p95_ratio:
+            raise RuntimeError(
+                f"Scenario={scenario_id} service={service_name} failed p95 ratio: "
+                f"{p95_ratio:.2f} > {max_p95_ratio:.2f}"
+            )
+        if mean_ratio > max_mean_ratio:
+            raise RuntimeError(
+                f"Scenario={scenario_id} service={service_name} failed mean ratio: "
+                f"{mean_ratio:.2f} > {max_mean_ratio:.2f}"
+            )
+        ratio_summary[service_name] = {"ratio_mean": mean_ratio, "ratio_p95": p95_ratio}
+    return ratio_summary
+
+
+def _run_perf_check(
+    *,
+    scenario_id: str,
+    service_bases: dict[str, str],
+    compare_cfg: dict[str, object],
+    path: str,
+    payload: bytes,
+    content_type: str,
+    accept: str,
+) -> dict[str, object]:
+    """Run the performance check for one scenario and return the perf result dict."""
+    cfg: dict[str, Any] = cast(dict[str, Any], compare_cfg)
+    perf_runner = str(cfg.get("perf_runner", "request_count"))
+    warmup_requests = int(cfg.get("warmup_requests", 5))
+    measured_requests = int(cfg.get("measured_requests", 40))
+    rate_rps = int(cfg.get("rate_rps", 15))
+    duration_s = int(cfg.get("duration_s", 15))
+    max_p95_ratio = float(cfg.get("max_p95_ratio", 2.0))
+    max_mean_ratio = float(cfg.get("max_mean_ratio", 2.0))
+    baseline_service = str(cfg.get("baseline_service", min(service_bases.keys())))
+    if baseline_service not in service_bases:
+        raise RuntimeError(
+            f"Scenario={scenario_id} baseline_service={baseline_service} is not configured"
+        )
+
+    perf_stats = _collect_perf_stats(
+        scenario_id=scenario_id,
+        service_bases=service_bases,
+        path=path,
+        payload=payload,
+        content_type=content_type,
+        accept=accept,
+        perf_runner=perf_runner,
+        warmup_requests=warmup_requests,
+        measured_requests=measured_requests,
+        rate_rps=rate_rps,
+        duration_s=duration_s,
+    )
+    ratio_summary = _compute_ratio_summary(
+        scenario_id=scenario_id,
+        perf_stats=perf_stats,
+        baseline_service=baseline_service,
+        max_p95_ratio=max_p95_ratio,
+        max_mean_ratio=max_mean_ratio,
+    )
+
+    print(f"[perf] scenario={scenario_id} baseline={baseline_service}")
+    for service_name in sorted(perf_stats.keys()):
+        stats = perf_stats[service_name]
+        print(
+            "  - %s mean=%.2fms p95=%.2fms rps=%.2f"
+            % (service_name, stats["mean_ms"], stats["p95_ms"], stats["rps"])
+        )
+    for service_name in sorted(ratio_summary.keys()):
+        ratios = ratio_summary[service_name]
+        print(
+            "  - ratio(%s/%s) mean=%.2f p95=%.2f"
+            % (service_name, baseline_service, ratios["ratio_mean"], ratios["ratio_p95"])
+        )
+    return {
+        "runner": perf_runner,
+        "baseline_service": baseline_service,
+        "services": perf_stats,
+        "ratios": ratio_summary,
+    }
+
+
+def _run_scenario_checks(
+    *,
+    scenario_id: str,
+    checks: set[str],
+    service_bases: dict[str, str],
+    compare_cfg: dict[str, object],
+    path: str,
+    payload: bytes,
+    content_type: str,
+    accept: str,
+) -> dict[str, object]:
+    """Run all enabled checks for one scenario and return the result dict."""
+    scenario_result: dict[str, object] = {"scenario": scenario_id}
+
+    if "parity" in checks:
+        parity_svcs = compare_cfg.get("parity_services")
+        _run_parity(
+            service_bases=service_bases,
+            parity_services=list(cast(list[str], parity_svcs))
+            if isinstance(parity_svcs, list)
+            else None,
+            path=path,
+            payload=payload,
+            content_type=content_type,
+            accept=accept,
+        )
+        print(f"[parity] scenario={scenario_id} ok")
+        scenario_result["parity"] = "ok"
+
+    if "property" in checks:
+        print(
+            f"[property] scenario={scenario_id} scaffold ready at workloads/hypothesis/parity_props.py"
+        )
+        scenario_result["property"] = "scaffold"
+
+    if "perf" in checks:
+        scenario_result["perf"] = _run_perf_check(
+            scenario_id=scenario_id,
+            service_bases=service_bases,
+            compare_cfg=compare_cfg,
+            path=path,
+            payload=payload,
+            content_type=content_type,
+            accept=accept,
+        )
+
+    return scenario_result
+
+
+def _run_scenario(
+    *,
+    scenario: dict[str, object],
+    hub_root: Path,
+    mode: str,
+    checks: set[str],
+) -> dict[str, object]:
+    """Prepare and run all checks for a single scenario."""
+    scenario_id = str(scenario["id"])
+    _prepare_scenario_model(hub_root, scenario)
+
+    path, health_path, content_type, accept, payload = _parse_request_cfg(scenario_id, scenario)
+
+    compare_cfg = scenario.get("compare", {})
+    if not isinstance(compare_cfg, dict):
+        compare_cfg = {}
+
+    active_services: set[str] | None = None
+    if isinstance(compare_cfg.get("active_services"), list):
+        active_services = {str(name) for name in compare_cfg["active_services"]}
+
+    with ModeRunner(hub_root=hub_root, mode=mode, active_services=active_services) as runner:
+        raw_services = runner.config["services"]
+        service_bases = {
+            str(name): str(value["base_url"])
+            for name, value in raw_services.items()
+            if active_services is None or str(name) in active_services
+        }
+        for service_name, base_url in service_bases.items():
+            wait_http_ok(f"{base_url}{health_path}")
+
+        return _run_scenario_checks(
+            scenario_id=scenario_id,
+            checks=checks,
+            service_bases=service_bases,
+            compare_cfg=compare_cfg,
+            path=path,
+            payload=payload,
+            content_type=content_type,
+            accept=accept,
+        )
 
 
 def main() -> None:
@@ -248,168 +502,10 @@ def main() -> None:
     selected_scenarios = _load_scenarios(root, args.scenario)
 
     checks = {c.strip() for c in args.checks.split(",") if c.strip()}
-    all_results: list[dict[str, object]] = []
-
-    for scenario in selected_scenarios:
-        scenario_id = str(scenario["id"])
-        _prepare_scenario_model(hub_root, scenario)
-
-        request_cfg = scenario.get("request", {})
-        if not isinstance(request_cfg, dict):
-            raise RuntimeError(f"Invalid request section for scenario={scenario_id}")
-        path = str(request_cfg.get("path", "/invocations"))
-        health_path = str(request_cfg.get("health_path", "/healthz"))
-        content_type = str(request_cfg.get("content_type", "text/csv"))
-        accept = str(request_cfg.get("accept", "application/json"))
-        payload_file = request_cfg.get("payload_file")
-        if not isinstance(payload_file, str):
-            raise RuntimeError(f"Scenario={scenario_id} must define request.payload_file")
-        payload = (Path(scenario["_folder"]) / payload_file).read_bytes()
-        compare_cfg = scenario.get("compare", {})
-        if not isinstance(compare_cfg, dict):
-            compare_cfg = {}
-
-        active_services = None
-        if isinstance(compare_cfg.get("active_services"), list):
-            active_services = {str(name) for name in compare_cfg["active_services"]}
-
-        with ModeRunner(
-            hub_root=hub_root,
-            mode=args.mode,
-            active_services=active_services,
-        ) as runner:
-            raw_services = runner.config["services"]
-            service_bases = {
-                str(name): str(value["base_url"])
-                for name, value in raw_services.items()
-                if active_services is None or str(name) in active_services
-            }
-            for service_name, base_url in service_bases.items():
-                wait_http_ok(f"{base_url}{health_path}")
-
-            scenario_result: dict[str, object] = {"scenario": scenario_id}
-
-            if "parity" in checks:
-                _run_parity(
-                    service_bases=service_bases,
-                    parity_services=(
-                        list(compare_cfg["parity_services"])
-                        if isinstance(compare_cfg.get("parity_services"), list)
-                        else None
-                    ),
-                    path=path,
-                    payload=payload,
-                    content_type=content_type,
-                    accept=accept,
-                )
-                print(f"[parity] scenario={scenario_id} ok")
-                scenario_result["parity"] = "ok"
-
-            if "property" in checks:
-                print(
-                    f"[property] scenario={scenario_id} scaffold ready at workloads/hypothesis/parity_props.py"
-                )
-                scenario_result["property"] = "scaffold"
-
-            if "perf" in checks:
-                perf_runner = str(compare_cfg.get("perf_runner", "request_count"))
-                warmup_requests = int(compare_cfg.get("warmup_requests", 5))
-                measured_requests = int(compare_cfg.get("measured_requests", 40))
-                rate_rps = int(compare_cfg.get("rate_rps", 15))
-                duration_s = int(compare_cfg.get("duration_s", 15))
-                max_p95_ratio = float(compare_cfg.get("max_p95_ratio", 2.0))
-                max_mean_ratio = float(compare_cfg.get("max_mean_ratio", 2.0))
-                baseline_service = str(
-                    compare_cfg.get("baseline_service", sorted(service_bases.keys())[0])
-                )
-                if baseline_service not in service_bases:
-                    raise RuntimeError(
-                        f"Scenario={scenario_id} baseline_service={baseline_service} is not configured"
-                    )
-
-                perf_stats: dict[str, dict[str, float]] = {}
-                for service_name, base_url in sorted(service_bases.items()):
-                    if perf_runner == "deterministic_http":
-                        perf_stats[service_name] = _measure_latency_deterministic(
-                            base_url=base_url,
-                            path=path,
-                            payload=payload,
-                            content_type=content_type,
-                            accept=accept,
-                            warmup_requests=warmup_requests,
-                            rate_rps=rate_rps,
-                            duration_s=duration_s,
-                        )
-                    elif perf_runner == "request_count":
-                        perf_stats[service_name] = _measure_latency(
-                            base_url=base_url,
-                            path=path,
-                            payload=payload,
-                            content_type=content_type,
-                            accept=accept,
-                            warmup_requests=warmup_requests,
-                            measured_requests=measured_requests,
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Scenario={scenario_id} unknown perf_runner={perf_runner}"
-                        )
-
-                baseline_stats = perf_stats[baseline_service]
-                ratio_summary: dict[str, dict[str, float]] = {}
-                for service_name, stats in perf_stats.items():
-                    if service_name == baseline_service:
-                        continue
-                    p95_ratio = (
-                        stats["p95_ms"] / baseline_stats["p95_ms"]
-                        if baseline_stats["p95_ms"]
-                        else 1.0
-                    )
-                    mean_ratio = (
-                        stats["mean_ms"] / baseline_stats["mean_ms"]
-                        if baseline_stats["mean_ms"]
-                        else 1.0
-                    )
-                    if p95_ratio > max_p95_ratio:
-                        raise RuntimeError(
-                            f"Scenario={scenario_id} service={service_name} failed p95 ratio: "
-                            f"{p95_ratio:.2f} > {max_p95_ratio:.2f}"
-                        )
-                    if mean_ratio > max_mean_ratio:
-                        raise RuntimeError(
-                            f"Scenario={scenario_id} service={service_name} failed mean ratio: "
-                            f"{mean_ratio:.2f} > {max_mean_ratio:.2f}"
-                        )
-                    ratio_summary[service_name] = {
-                        "ratio_mean": mean_ratio,
-                        "ratio_p95": p95_ratio,
-                    }
-
-                print(f"[perf] scenario={scenario_id} baseline={baseline_service}")
-                for service_name in sorted(perf_stats.keys()):
-                    stats = perf_stats[service_name]
-                    print(
-                        "  - %s mean=%.2fms p95=%.2fms rps=%.2f"
-                        % (service_name, stats["mean_ms"], stats["p95_ms"], stats["rps"])
-                    )
-                for service_name in sorted(ratio_summary.keys()):
-                    ratios = ratio_summary[service_name]
-                    print(
-                        "  - ratio(%s/%s) mean=%.2f p95=%.2f"
-                        % (
-                            service_name,
-                            baseline_service,
-                            ratios["ratio_mean"],
-                            ratios["ratio_p95"],
-                        )
-                    )
-                scenario_result["perf"] = {
-                    "runner": perf_runner,
-                    "baseline_service": baseline_service,
-                    "services": perf_stats,
-                    "ratios": ratio_summary,
-                }
-            all_results.append(scenario_result)
+    all_results: list[dict[str, object]] = [
+        _run_scenario(scenario=scenario, hub_root=hub_root, mode=args.mode, checks=checks)
+        for scenario in selected_scenarios
+    ]
 
     report = {
         "mode": args.mode,
