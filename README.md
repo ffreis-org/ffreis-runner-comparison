@@ -1,5 +1,9 @@
 # ONNX Runner Comparison Harness
 
+<!-- ffreis-badges:start -->
+[![CI](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FelipeFuhr/ffreis-badges/main/badges/ffreis-runner-comparison/ci.json)](https://github.com/FelipeFuhr/ffreis-runner-comparison/actions) [![License](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/FelipeFuhr/ffreis-badges/main/badges/ffreis-runner-comparison/license.json)](https://github.com/FelipeFuhr/ffreis-runner-comparison/blob/main/LICENSE)
+<!-- ffreis-badges:end -->
+
 Compares Python and Rust ONNX serving implementations in two modes:
 
 - `container`: starts both services with Docker/Podman Compose
